@@ -76,19 +76,29 @@ export class GraphManager implements IGraphManager {
   private providerDetected: boolean = false;
 
   constructor(uri: string, user: string, password: string) {
+    // Encryption configuration: default to disabled for dev compatibility
+    // Set NEO4J_ENCRYPTED=true to enable encryption (required for production with TLS)
+    const encryptedEnv = process.env.NEO4J_ENCRYPTED?.toLowerCase();
+    const encrypted = encryptedEnv === 'true' || encryptedEnv === '1'
+      ? 'ENCRYPTION_ON'
+      : 'ENCRYPTION_OFF';
+
+    console.log(`🔌 Connecting to Neo4j: ${uri} (encrypted: ${encrypted})`);
+
     this.driver = neo4j.driver(
       uri,
       neo4j.auth.basic(user, password),
       {
         maxConnectionPoolSize: 50,
         connectionAcquisitionTimeout: 60000,
-        connectionTimeout: 30000
+        connectionTimeout: 30000,
+        encrypted: encrypted
       }
     );
-    
+
     // Note: Embeddings service initialization deferred until after provider detection
     // This happens in initialize() to avoid wasting resources on NornicDB connections
-    
+
     // Initialize unified search service
     this.unifiedSearchService = new UnifiedSearchService(this.driver);
     this.unifiedSearchService.initialize().catch(err => {
@@ -168,30 +178,30 @@ export class GraphManager implements IGraphManager {
       // Execute a simple query and check server metadata
       const result = await session.run('RETURN 1 as test');
       const summary = result.summary;
-      
+
       // Check server agent string
       const serverInfo = summary.server;
       const serverAgent = serverInfo?.agent || '';
       const serverVersion = serverInfo?.protocolVersion?.toString() || '';
-      
+
       // NornicDB identifies itself in the server agent
       if (serverAgent.toLowerCase().includes('nornicdb')) {
         console.log(`🗄️  Detected NornicDB (${serverAgent})`);
         this.isNornicDB = true;
         return;
       }
-      
+
       // Neo4j standard identification
       if (serverAgent.toLowerCase().includes('neo4j')) {
         console.log(`🗄️  Detected Neo4j (${serverAgent})`);
         this.isNornicDB = false;
         return;
       }
-      
+
       // Fallback: assume Neo4j if we can't detect NornicDB
       console.log(`🗄️  Unable to detect database provider, defaulting to Neo4j (agent: ${serverAgent})`);
       this.isNornicDB = false;
-      
+
     } catch (error: any) {
       console.warn(`⚠️  Database provider detection failed: ${error.message}`);
       console.log('🗄️  Defaulting to Neo4j');
@@ -250,7 +260,7 @@ export class GraphManager implements IGraphManager {
       if (!this.providerDetected) {
         await this.detectDatabaseProvider();
         this.providerDetected = true;
-        
+
         // Initialize embeddings service only if NOT using NornicDB
         if (!this.isNornicDB) {
           this.embeddingsService = new EmbeddingsService();
@@ -262,7 +272,7 @@ export class GraphManager implements IGraphManager {
           console.log('🗄️  NornicDB detected - embeddings will be handled by database');
         }
       }
-      
+
       // Unique constraint on node IDs
       await session.run(`
         CREATE CONSTRAINT node_id_unique IF NOT EXISTS 
@@ -284,7 +294,7 @@ export class GraphManager implements IGraphManager {
       // ─────────────────────────────────────────────────────────────
       // File Indexing Schema (Phase 1)
       // ─────────────────────────────────────────────────────────────
-      
+
       // WatchConfig unique ID constraint
       await session.run(`
         CREATE CONSTRAINT watch_config_id_unique IF NOT EXISTS
@@ -310,12 +320,12 @@ export class GraphManager implements IGraphManager {
       } catch (error) {
         // Ignore if index doesn't exist
       }
-      
+
       await session.run(`
         CREATE FULLTEXT INDEX file_metadata_search IF NOT EXISTS
         FOR (f:File) ON EACH [f.path, f.name, f.language]
       `);
-      
+
       // Full-text search on file chunk content
       await session.run(`
         CREATE FULLTEXT INDEX file_chunk_content_search IF NOT EXISTS
@@ -327,9 +337,9 @@ export class GraphManager implements IGraphManager {
       const configLoader = LLMConfigLoader.getInstance();
       const embeddingsConfig = await configLoader.getEmbeddingsConfig();
       const dimensions = embeddingsConfig?.dimensions || 768;
-      
+
       console.log(`🔧 Creating vector index with ${dimensions} dimensions`);
-      
+
       await session.run(`
         CREATE VECTOR INDEX node_embedding_index IF NOT EXISTS
         FOR (n:Node) ON (n.embedding)
@@ -380,7 +390,7 @@ export class GraphManager implements IGraphManager {
    */
   private extractTextContent(properties: Record<string, any>): string {
     const parts: string[] = [];
-    
+
     // Priority fields first
     if (properties.title && typeof properties.title === 'string') {
       parts.push(`Title: ${properties.title}`);
@@ -394,22 +404,22 @@ export class GraphManager implements IGraphManager {
     if (properties.content && typeof properties.content === 'string') {
       parts.push(`Content: ${properties.content}`);
     }
-    
+
     // Now include ALL other properties (stringified)
-    const systemFields = new Set(['id', 'type', 'created', 'updated', 'title', 'name', 'description', 'content', 
-                                   'embedding', 'embedding_dimensions', 'embedding_model', 'has_embedding']);
-    
+    const systemFields = new Set(['id', 'type', 'created', 'updated', 'title', 'name', 'description', 'content',
+      'embedding', 'embedding_dimensions', 'embedding_model', 'has_embedding']);
+
     for (const [key, value] of Object.entries(properties)) {
       // Skip system fields and already-included fields
       if (systemFields.has(key)) {
         continue;
       }
-      
+
       // Skip null/undefined
       if (value === null || value === undefined) {
         continue;
       }
-      
+
       // Stringify the value
       let stringValue: string;
       if (typeof value === 'string') {
@@ -427,12 +437,12 @@ export class GraphManager implements IGraphManager {
       } else {
         stringValue = String(value);
       }
-      
+
       if (stringValue.trim().length > 0) {
         parts.push(`${key}: ${stringValue}`);
       }
     }
-    
+
     return parts.join('\n');
   }
 
@@ -441,27 +451,27 @@ export class GraphManager implements IGraphManager {
    * Returns chunk data or null if content is small enough for a single embedding
    */
   private async createNodeChunks(
-    nodeId: string, 
-    textContent: string, 
+    nodeId: string,
+    textContent: string,
     session: any
   ): Promise<{ chunkCount: number; totalChars: number } | null> {
     const chunkSize = parseInt(process.env.MIMIR_EMBEDDINGS_CHUNK_SIZE || '768', 10);
-    
+
     // If content is small, don't chunk - return null to signal single embedding
     if (textContent.length <= chunkSize) {
       return null;
     }
-    
+
     console.log(`📦 Creating chunks for node ${nodeId} (${textContent.length} chars)...`);
-    
+
     try {
       // Generate chunk embeddings
       const chunks = await this.embeddingsService!.generateChunkEmbeddings(textContent);
-      
+
       // Create chunk nodes and relationships
       for (const chunk of chunks) {
         const chunkId = `chunk-${nodeId}-${chunk.chunkIndex}`;
-        
+
         await session.run(
           `
           MATCH (n:Node {id: $nodeId})
@@ -503,7 +513,7 @@ export class GraphManager implements IGraphManager {
           }
         );
       }
-      
+
       console.log(`✅ Created ${chunks.length} chunks for node ${nodeId}`);
       return { chunkCount: chunks.length, totalChars: textContent.length };
     } catch (error: any) {
@@ -620,27 +630,27 @@ export class GraphManager implements IGraphManager {
       // Now generate embeddings if enabled and not already provided
       // Skip embedding generation for NornicDB (database handles it natively)
       const hasExistingEmbedding = actualProperties.embedding || actualProperties.has_embedding === true;
-      
+
       if (!this.isNornicDB && this.embeddingsService && !hasExistingEmbedding) {
         // Ensure embeddings service is initialized
         if (!this.embeddingsService.isEnabled()) {
           await this.embeddingsService.initialize();
         }
-        
+
         if (this.embeddingsService.isEnabled()) {
           // Extract text content for embedding generation
           const textContent = this.extractTextContent(actualProperties);
-          
+
           if (textContent && textContent.trim().length > 0) {
             const chunkSize = parseInt(process.env.MIMIR_EMBEDDINGS_CHUNK_SIZE || '768', 10);
-            
+
             try {
               // Check if content needs chunking
               if (textContent.length > chunkSize) {
                 // Large content - use chunking
                 console.log(`📦 Node ${id} has large content (${textContent.length} chars), creating chunks...`);
                 await this.createNodeChunks(id, textContent, session);
-                
+
                 // Update node to mark it has chunks (no single embedding on parent node)
                 await session.run(
                   `MATCH (n:Node {id: $id}) SET n.has_embedding = true, n.has_chunks = true`,
@@ -819,10 +829,10 @@ export class GraphManager implements IGraphManager {
 
       // Regenerate embeddings if content changed and embeddings service is enabled
       // Skip embedding regeneration for NornicDB (database handles it natively)
-      const contentChanged = properties.content !== undefined || 
-                            properties.text !== undefined || 
-                            properties.title !== undefined ||
-                            properties.description !== undefined;
+      const contentChanged = properties.content !== undefined ||
+        properties.text !== undefined ||
+        properties.title !== undefined ||
+        properties.description !== undefined;
 
       if (!this.isNornicDB && contentChanged && this.embeddingsService) {
         // Ensure embeddings service is initialized
@@ -842,7 +852,7 @@ export class GraphManager implements IGraphManager {
               if (textContent.length > chunkSize) {
                 // Large content - use chunking
                 console.log(`📦 Node ${id} has large content (${textContent.length} chars), regenerating chunks...`);
-                
+
                 // Delete existing chunks first
                 await session.run(
                   `MATCH (n:Node {id: $id})
@@ -850,7 +860,7 @@ export class GraphManager implements IGraphManager {
                    DELETE r, chunk`,
                   { id }
                 );
-                
+
                 await this.createNodeChunks(id, textContent, session);
 
                 // Update node to mark it has chunks (no single embedding on parent node)
@@ -864,7 +874,7 @@ export class GraphManager implements IGraphManager {
               } else {
                 // Small content - single embedding
                 const embeddingResult = await this.embeddingsService.generateEmbedding(textContent);
-                
+
                 // Delete existing chunks if any
                 await session.run(
                   `MATCH (n:Node {id: $id})
@@ -1003,7 +1013,7 @@ export class GraphManager implements IGraphManager {
     const session = this.driver.session();
     try {
       const now = new Date().toISOString();
-      
+
       // First, prepare all nodes with IDs and base properties
       const preparedNodes = nodes.map((n) => {
         const flatProps = flattenForMCP(n.properties || {});
@@ -1036,13 +1046,13 @@ export class GraphManager implements IGraphManager {
 
         if (this.embeddingsService.isEnabled()) {
           const chunkSize = parseInt(process.env.MIMIR_EMBEDDINGS_CHUNK_SIZE || '768', 10);
-          
+
           // Process each node's embeddings
           for (let i = 0; i < nodes.length; i++) {
             const originalNode = nodes[i];
             const nodeId = preparedNodes[i].id;
             const textContent = this.extractTextContent(originalNode.properties || {});
-            
+
             if (textContent && textContent.trim().length > 0) {
               try {
                 // Check if content needs chunking
@@ -1050,7 +1060,7 @@ export class GraphManager implements IGraphManager {
                   // Large content - use chunking
                   console.log(`📦 Bulk node ${nodeId} has large content (${textContent.length} chars), creating chunks...`);
                   await this.createNodeChunks(nodeId, textContent, session);
-                  
+
                   // Update node to mark it has chunks
                   await session.run(
                     `MATCH (n:Node {id: $id}) SET n.has_embedding = true, n.has_chunks = true`,
@@ -1170,7 +1180,7 @@ export class GraphManager implements IGraphManager {
         { edges: edgesWithIds }
       );
 
-      return result.records.map(r => 
+      return result.records.map(r =>
         this.edgeFromRecord(r.get('e'), r.get('source'), r.get('target'))
       );
     } finally {
@@ -1262,25 +1272,25 @@ export class GraphManager implements IGraphManager {
   async searchNodes(query: string, options: SearchOptions = {}): Promise<Node[]> {
     // Use UnifiedSearchService for automatic semantic/fulltext fallback
     await this.unifiedSearchService.initialize();
-    
+
     const searchResult = await this.unifiedSearchService.search(query, {
       types: options.types,
       limit: options.limit || 100,
       minSimilarity: options.minSimilarity || 0.75, // Default threshold
       offset: options.offset || 0
     });
-    
+
     // Convert SearchResult[] to Node[] format
     // Note: UnifiedSearchService returns formatted results, we need to fetch full nodes
     if (searchResult.results.length === 0) {
       return [];
     }
-    
+
     const session = this.driver.session();
     try {
       // Get full node data for the IDs returned by search
       const ids = searchResult.results.map(r => r.id);
-      
+
       const result = await session.run(
         `
         MATCH (n)
@@ -1330,7 +1340,7 @@ export class GraphManager implements IGraphManager {
     const session = this.driver.session();
     try {
       let query = '';
-      
+
       if (direction === 'out') {
         query = 'MATCH (n:Node {id: $nodeId})-[e:EDGE]->(t:Node) RETURN e, n.id as source, t.id as target';
       } else if (direction === 'in') {
@@ -1340,7 +1350,7 @@ export class GraphManager implements IGraphManager {
       }
 
       const result = await session.run(query, { nodeId });
-      return result.records.map(r => 
+      return result.records.map(r =>
         this.edgeFromRecord(r.get('e'), r.get('source'), r.get('target'))
       );
     } finally {
@@ -1428,7 +1438,7 @@ export class GraphManager implements IGraphManager {
 
       const record = result.records[0];
       const nodes = record.get('allNodes').map((n: any) => this.nodeFromRecord(n, undefined, false));
-      const edges = record.get('allEdges').map((e: any) => 
+      const edges = record.get('allEdges').map((e: any) =>
         this.edgeFromRecord(e, e.start, e.end)
       );
 
@@ -1493,7 +1503,7 @@ export class GraphManager implements IGraphManager {
       }
       let query: string;
       let params: any = {};
-      
+
       if (type === 'ALL') {
         // Clear ALL data - explicit "ALL" required for safety
         query = `
@@ -1507,11 +1517,11 @@ export class GraphManager implements IGraphManager {
         const result = await session.run(query, params);
         const deletedNodes = result.records[0]?.get('deletedNodes').toNumber() || 0;
         const deletedEdges = result.records[0]?.get('deletedEdges').toNumber() || 0;
-        
+
         // Reset counters
         this.nodeCounter = 0;
         this.edgeCounter = 0;
-        
+
         console.log(`✅ Cleared ALL data from graph: ${deletedNodes} nodes, ${deletedEdges} edges`);
         return { deletedNodes, deletedEdges };
       } else if (type) {
@@ -1525,11 +1535,11 @@ export class GraphManager implements IGraphManager {
           RETURN count(n) as deletedNodes, sum(edgeCount) as deletedEdges
         `;
         params = { type, capitalizedType };
-        
+
         const result = await session.run(query, params);
         const deletedNodes = result.records[0]?.get('deletedNodes').toNumber() || 0;
         const deletedEdges = result.records[0]?.get('deletedEdges').toNumber() || 0;
-        
+
         console.log(`✅ Cleared ${deletedNodes} nodes of type '${type}' and ${deletedEdges} edges`);
         return { deletedNodes, deletedEdges };
       } else {
@@ -1558,13 +1568,13 @@ export class GraphManager implements IGraphManager {
   private nodeFromRecord(record: any, searchQuery?: string, stripContent: boolean = true): Node {
     // Handle map projection (plain object) vs node object (with .properties)
     const props = record.properties || record;
-    
+
     // Extract system properties
     const { id, type, created, updated, ...userProperties } = props;
-    
+
     // Note: embedding is already stripped at the database level in all queries
     // Keep metadata about embeddings (has_embedding, embedding_dimensions, embedding_model)
-    
+
     return {
       id,
       type,
@@ -1576,10 +1586,10 @@ export class GraphManager implements IGraphManager {
 
   private edgeFromRecord(record: any, source: string, target: string): Edge {
     const props = record.properties;
-    
+
     // Extract system properties and treat the rest as user properties
     const { id, type, created, ...userProperties } = props;
-    
+
     return {
       id,
       source,

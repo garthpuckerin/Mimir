@@ -69,14 +69,26 @@ export type { IGraphManager };
  */
 export async function createGraphManager(): Promise<GraphManager> {
   const uri = process.env.NEO4J_URI || 'bolt://localhost:7687';
-  const user = process.env.NEO4J_USER || 'neo4j';
-  const password = process.env.NEO4J_PASSWORD || 'password';
+
+  // Support both NEO4J_AUTH (user/pass format) and separate NEO4J_USER/NEO4J_PASSWORD
+  let user = process.env.NEO4J_USER || 'neo4j';
+  let password = process.env.NEO4J_PASSWORD || 'password';
+
+  // Parse NEO4J_AUTH if provided (format: "user/pass")
+  if (process.env.NEO4J_AUTH) {
+    const authParts = process.env.NEO4J_AUTH.split('/');
+    if (authParts.length >= 2) {
+      user = authParts[0];
+      password = authParts.slice(1).join('/'); // Handle passwords with '/'
+      console.log(`🔑 Using NEO4J_AUTH credentials (user: ${user})`);
+    }
+  }
 
   const manager = new GraphManager(uri, user, password);
-  
+
   // Initialize schema
   await manager.initialize();
-  
+
   // Test connection
   const connected = await manager.testConnection();
   if (!connected) {
@@ -84,7 +96,7 @@ export async function createGraphManager(): Promise<GraphManager> {
   }
 
   console.log('✅ GraphManager initialized and connected to Neo4j');
-  
+
   return manager;
 }
 
