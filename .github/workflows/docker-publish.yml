@@ -1,0 +1,12 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    uses: garthpuckerin/devops/.github/workflows/docker-publish.yml@main
+    permissions:
+      contents: read
+      packages: write
