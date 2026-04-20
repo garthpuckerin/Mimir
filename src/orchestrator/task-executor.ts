@@ -16,6 +16,11 @@ import { CancellationError, type CancellationToken } from './cancellation.js';
 import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs/promises';
+import { fileURLToPath } from 'url';
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 
 // Module-level GraphManager instance (initialized on first use)
@@ -650,7 +655,9 @@ export async function generatePreamble(
       if (result.records.length > 0) {
         const content = result.records[0].get('content');
         const nodeId = result.records[0].get('id');
-        const usedCount = result.records[0].get('usedCount') || 0;
+        const rawUsedCount = result.records[0].get('usedCount') || 0;
+        // TODO: Remove BigInt cast once NornicDB returns integers as Number instead of BigInt
+        const usedCount = typeof rawUsedCount === 'bigint' ? Number(rawUsedCount) : (rawUsedCount?.toNumber?.() || rawUsedCount || 0);
         
         // Update usedCount and lastUsed
         await graphManager.updateNode(nodeId, {
@@ -1222,34 +1229,55 @@ async function fetchTaskContext(taskId: string, agentType: 'worker' | 'qc'): Pro
 }
 
 /**
+ * Helper to wrap a promise with a timeout
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, operation: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => 
+      setTimeout(() => reject(new Error(`${operation} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+
+/**
  * Create task node in graph for tracking (idempotent)
+ * Has 5 second timeout to prevent hanging on DB issues
  */
 async function createGraphNode(taskId: string, properties: Record<string, any>): Promise<void> {
-  const graphManager = await getGraphManager();
+  const TIMEOUT_MS = 5000;
   
   try {
-    // Try to get existing node first
-    const existing = await graphManager.getNode(taskId);
+    const graphManager = await withTimeout(getGraphManager(), TIMEOUT_MS, 'getGraphManager');
     
-    if (existing) {
-      console.log(`♻️  Task node ${taskId} already exists, updating instead`);
-      await graphManager.updateNode(taskId, properties);
-      return;
+    try {
+      // Try to get existing node first
+      const existing = await withTimeout(graphManager.getNode(taskId), TIMEOUT_MS, 'getNode');
+      
+      if (existing) {
+        console.log(`♻️  Task node ${taskId} already exists, updating instead`);
+        await withTimeout(graphManager.updateNode(taskId, properties), TIMEOUT_MS, 'updateNode');
+        return;
+      }
+    } catch (error: any) {
+      // Node doesn't exist or timed out, try to create it
+      if (!error.message?.includes('timed out')) {
+        // Node doesn't exist, continue to create
+      } else {
+        console.warn(`⚠️  Graph getNode timed out for ${taskId}, skipping graph node creation`);
+        return;
+      }
     }
-  } catch (error) {
-    // Node doesn't exist, create it
-  }
-  
-  // Create new node
-  console.log(`💾 Creating task node: ${taskId}`);
-  try {
-    await graphManager.addNode('todo', {
+    
+    // Create new node
+    console.log(`💾 Creating task node: ${taskId}`);
+    await withTimeout(graphManager.addNode('todo', {
       id: taskId,
       ...properties,
-    });
+    }), TIMEOUT_MS, 'addNode');
     console.log(`✅ Task node created: ${taskId}`);
   } catch (error: any) {
-    console.error(`❌ Failed to create graph node ${taskId}:`, error.message);
+    console.warn(`⚠️  Graph operation failed for ${taskId}: ${error.message} - continuing without graph node`);
     // Don't throw - log and continue (allows execution to proceed even if graph fails)
   }
 }
@@ -1258,10 +1286,11 @@ async function createGraphNode(taskId: string, properties: Record<string, any>):
  * Update task node in graph
  */
 async function updateGraphNode(taskId: string, properties: Record<string, any>): Promise<void> {
+  const TIMEOUT_MS = 5000;
+  
   try {
-    const graphManager = await getGraphManager();
-    
-    await graphManager.updateNode(taskId, properties);
+    const graphManager = await withTimeout(getGraphManager(), TIMEOUT_MS, 'getGraphManager');
+    await withTimeout(graphManager.updateNode(taskId, properties), TIMEOUT_MS, 'updateNode');
   } catch (error: any) {
     console.warn(`⚠️  Failed to update graph node: ${error.message}`);
   }
@@ -1557,6 +1586,8 @@ export async function executeTask(
   console.log(`⏱️  Estimated Duration: ${task.estimatedDuration}`);
   console.log('='.repeat(80) + '\n');
   
+  console.log(`[DEBUG] Task prompt length: ${task.prompt?.length || 0} chars`);
+  
   const startTime = Date.now();
   const maxRetries = task.maxRetries || 2;
   let attemptNumber = 1;
@@ -1570,6 +1601,8 @@ export async function executeTask(
   if (!task.qcRole || !qcPreambleContent) {
     throw new Error(`Task ${task.id} missing QC configuration. QC is now mandatory for all tasks. Please regenerate chain-output.md with QC roles.`);
   }
+  
+  console.log(`[DEBUG] QC check passed, creating graph node...`);
   
   // Create initial task node in graph for tracking
   await createGraphNode(task.id, {
@@ -1587,6 +1620,8 @@ export async function executeTask(
     files: [], // Will be populated by context manager if needed
     dependencies: [], // Will be populated by context manager if needed
   });
+  
+  console.log(`[DEBUG] Graph node created, starting worker loop...`);
   
   // Worker → QC → Retry loop
   while (attemptNumber <= maxRetries) {
@@ -1772,6 +1807,7 @@ ${task.prompt}`;
       }
       
       // PHASE 2: Worker Execution Start
+      console.log(`[DEBUG] Building worker prompt complete, starting worker execution...`);
       const workerStartTime = new Date().toISOString();
       await updateGraphNode(task.id, {
         status: 'worker_executing',
