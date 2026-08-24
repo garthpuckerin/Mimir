@@ -187,6 +187,17 @@ export interface IGraphManager {
    */
   getDriver(): any;
 
+  /**
+   * Check if connected to NornicDB (vs Neo4j)
+   * 
+   * Both NornicDB and Neo4j return cosine similarity (0-1 range) from
+   * db.index.vector.queryNodes. NornicDB additionally supports server-side
+   * embedding generation, allowing string queries without client-side embeddings.
+   * 
+   * @returns true if connected to NornicDB, false for Neo4j
+   */
+  getIsNornicDB(): boolean;
+
   // ============================================================================
   // MULTI-AGENT LOCKING
   // ============================================================================
