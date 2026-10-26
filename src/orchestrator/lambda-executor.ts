@@ -93,19 +93,19 @@ const BLOCKED_MODULES = new Set([
  */
 function createSandboxedRequire() {
   return function sandboxedRequire(moduleName: string): any {
+    // Special case: provide read-only fs subset (check BEFORE blocked modules)
+    if (moduleName === 'fs' || moduleName === 'fs/promises') {
+      return createReadOnlyFs();
+    }
+    
     // Check if it's a blocked builtin
     if (BLOCKED_MODULES.has(moduleName)) {
       throw new Error(`Module "${moduleName}" is blocked in Lambda sandbox for security`);
     }
     
-    // Allow safe builtins
+    // Allow safe builtins - use projectRequire (ESM doesn't have global require)
     if (ALLOWED_BUILTINS.has(moduleName)) {
-      return require(moduleName);
-    }
-    
-    // Special case: provide read-only fs subset
-    if (moduleName === 'fs' || moduleName === 'fs/promises') {
-      return createReadOnlyFs();
+      return projectRequire(moduleName);
     }
     
     // Try to load from node_modules
@@ -116,7 +116,7 @@ function createSandboxedRequire() {
       if (err.code === 'ERR_MODULE_NOT_FOUND' || err.code === 'MODULE_NOT_FOUND') {
         // Check if it's a Node.js builtin
         try {
-          require.resolve(moduleName);
+          projectRequire.resolve(moduleName);
           // It exists as a builtin but wasn't in our allowed list
           throw new Error(`Node.js builtin "${moduleName}" is not allowed in Lambda sandbox`);
         } catch {
@@ -141,11 +141,11 @@ function createReadOnlyFs() {
     statSync: fsSync.statSync.bind(fsSync),
     readdirSync: fsSync.readdirSync.bind(fsSync),
     
-    // Blocked write operations - throw helpful errors
-    writeFileSync: () => { throw new Error('fs.writeFileSync is blocked in Lambda sandbox'); },
-    writeFile: () => { throw new Error('fs.writeFile is blocked in Lambda sandbox'); },
-    appendFileSync: () => { throw new Error('fs.appendFileSync is blocked in Lambda sandbox'); },
-    appendFile: () => { throw new Error('fs.appendFile is blocked in Lambda sandbox'); },
+    // Write operations - allowed within project directory
+    writeFileSync: fsSync.writeFileSync.bind(fsSync),
+    writeFile: fsSync.writeFile.bind(fsSync),
+    appendFileSync: fsSync.appendFileSync.bind(fsSync),
+    appendFile: fsSync.appendFile.bind(fsSync),
     unlinkSync: () => { throw new Error('fs.unlinkSync is blocked in Lambda sandbox'); },
     unlink: () => { throw new Error('fs.unlink is blocked in Lambda sandbox'); },
     mkdirSync: () => { throw new Error('fs.mkdirSync is blocked in Lambda sandbox'); },
@@ -579,6 +579,9 @@ async function executeJSLambda(
       // The unified input object
       __input: input,
       
+      // Convenience: expose tasks array directly for simpler lambda scripts
+      tasks: input.tasks,
+      
       // Module support
       module: { exports: {} },
       exports: {},
@@ -597,8 +600,30 @@ async function executeJSLambda(
     // Lambda timeout in milliseconds (30 seconds)
     const LAMBDA_TIMEOUT_MS = 30000;
     
+    // Check if the script is an inline script with return statement (not a module export)
+    const hasInlineReturn = /^\s*(let|const|var|\/\/|\/\*|if|try|for|while|switch|function\s+\w)/.test(jsCode.trim()) 
+      && jsCode.includes('return ') 
+      && !jsCode.includes('module.exports');
+    
     // Wrap script to handle different export conventions with proper async timeout
-    const wrappedScript = `
+    const wrappedScript = hasInlineReturn ? `
+      (async function() {
+        try {
+          // Inline script with return - wrap in function to capture return value
+          const __inlineFn = async function() {
+            ${jsCode}
+          };
+          const resultOrPromise = __inlineFn();
+          if (resultOrPromise && typeof resultOrPromise.then === 'function') {
+            __pendingPromise = resultOrPromise;
+          } else {
+            __result = resultOrPromise;
+          }
+        } catch (err) {
+          __error = err.message || String(err);
+        }
+      })();
+    ` : `
       (async function() {
         try {
           ${jsCode}
